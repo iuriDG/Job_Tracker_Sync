@@ -1,15 +1,3 @@
-# Job Tracker Auto-Decline Script
-# Scans Outlook inbox for rejection emails and updates job_tracker.xlsx
-#
-# Requirements:
-#     pip install openpyxl pywin32
-#     python -m pywin32_postinstall -install
-#
-# Usage:
-#     python job_tracker_auto_decline.py
-#     python job_tracker_auto_decline.py --dry-run
-#     python job_tracker_auto_decline.py --debug
-
 import argparse
 import re
 import sys
@@ -697,7 +685,7 @@ def run(excel_path, dry_run, debug):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Auto-decline job apps based on Outlook rejection emails.")
+    parser = argparse.ArgumentParser(description="Sync job application statuses from Outlook inbox to Excel tracker.")
     parser.add_argument("--excel",   type=Path, default=DEFAULT_EXCEL, help="Path to job_tracker.xlsx")
     parser.add_argument("--dry-run", action="store_true", help="Preview without saving")
     parser.add_argument("--debug",   action="store_true", help="Print all emails to diagnose missed matches")
