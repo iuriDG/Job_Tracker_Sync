@@ -1,23 +1,14 @@
-# job_tracker_sync.py
-#
-# Automatically updates your job application tracker Excel file
-# by scanning your Outlook inbox for rejection and interview emails.
+# Job Tracker Auto-Decline Script
+# Scans Outlook inbox for rejection emails and updates job_tracker.xlsx
 #
 # Requirements:
 #     pip install openpyxl pywin32
 #     python -m pywin32_postinstall -install
 #
-# Setup:
-#     1. Set TARGET_EMAIL to your Outlook email address
-#     2. Set DEFAULT_EXCEL to the path of your tracker, or place this
-#        script in the same folder as the Excel file
-#     3. Adjust COL_COMPANY, COL_STATUS, SHEET_NAME, DATA_START_ROW
-#        if your spreadsheet layout is different
-#
 # Usage:
-#     python job_tracker_sync.py
-#     python job_tracker_sync.py --dry-run    # preview without saving
-#     python job_tracker_sync.py --debug      # show all emails + matches
+#     python job_tracker_auto_decline.py
+#     python job_tracker_auto_decline.py --dry-run
+#     python job_tracker_auto_decline.py --debug
 
 import argparse
 import re
@@ -32,23 +23,19 @@ except ImportError:
 
 try:
     import openpyxl
+    from openpyxl.styles import Font
 except ImportError:
     sys.exit("ERROR: openpyxl is not installed.\nRun:  pip install openpyxl")
 
 
-# ---------- Configuration (edit these) ----------
+# ---------- Configuration ----------
 
-TARGET_EMAIL   = "your@email.com"          # Outlook account to scan
-DEFAULT_EXCEL  = Path(__file__).parent / "job_tracker.xlsx"  # Excel file path
-COL_COMPANY    = 1                          # Column A = company names
-COL_STATUS     = 4                          # Column D = status
-SHEET_NAME     = "Job Tracker"              # Sheet name in Excel
-DATA_START_ROW = 5                          # First row of data (skip headers)
-
-
-# ---------- Rejection phrases ----------
+DEFAULT_EXCEL = Path(__file__).parent / "job_tracker.xlsx"
+COL_COMPANY    = 1   # Column A
+COL_STATUS     = 4   # Column D
+# --- Rejection phrases ---
 # Covers: formal rejections, ATS auto-emails, polite declines,
-# post-interview rejections, and common recruiter phrasing
+# post-interview rejections, and non-English influenced phrasing
 REJECTION_PHRASES = [
     # Moving forward / proceeding
     "we will not be moving forward",
@@ -65,6 +52,10 @@ REJECTION_PHRASES = [
     "we are not proceeding",
     "not proceeding with your application",
     "not proceeding with your candidacy",
+    "unable to proceed with your candidacy",
+    "unable to proceed with your application",
+    "we're unable to proceed",
+    "we are unable to proceed",
     # Other candidates chosen
     "we have decided to move forward with other candidates",
     "decided to move forward with other candidates",
@@ -97,7 +88,7 @@ REJECTION_PHRASES = [
     "we won't be offering you",
     "no offer will be extended",
     "we will not be extending an offer",
-    # Regret / sorry
+    # Regret / sorry phrases
     "we regret to inform you",
     "we regret to let you know",
     "we regret to advise you",
@@ -148,9 +139,9 @@ REJECTION_PHRASES = [
     "your candidacy will not",
 ]
 
-# ---------- Interview / invitation phrases ----------
+# --- Interview / invitation phrases ---
 # Covers: phone screens, video calls, technical assessments,
-# on-site interviews, and recruiter reach-outs
+# on-site interviews, recruiter reach-outs and ATS invites
 INTERVIEW_PHRASES = [
     # Direct interview invite
     "invite you to an interview",
@@ -182,6 +173,7 @@ INTERVIEW_PHRASES = [
     "you've been selected to proceed",
     # Schedule / set up
     "schedule an interview",
+    "schedule a interview",
     "schedule your interview",
     "scheduling an interview",
     "like to schedule a time",
@@ -271,15 +263,47 @@ INTERVIEW_PHRASES = [
 ]
 
 
+# --- Application confirmation phrases ---
+APPLICATION_PHRASES = [
+    "thank you for your application",
+    "thank you for applying",
+    "we have received your application",
+    "we received your application",
+    "your application has been received",
+    "application has been submitted",
+    "thank you for considering",
+    "we are delighted that you",
+    "we're delighted that you",
+    "thanks for applying",
+    "your application to",
+    "we will be in touch",
+    "we'll be in touch",
+    "will get back to you",
+    "will be in touch as soon as",
+]
+
+SHEET_NAME     = "Job Tracker"
+DATA_START_ROW = 5   # Rows 1-4 are title/summary/blank/header
+COL_ROLE  = 2   # Column B
+COL_DATE  = 3   # Column C
+COL_NOTES = 5   # Column E
+
+
 # ---------- Outlook helpers ----------
+
+# Set this to the email address of the Outlook account you want to scan.
+# Example: "yourname@example.com"
+TARGET_EMAIL = "your-email@example.com"
 
 def get_all_emails(outlook):
     namespace = outlook.GetNamespace("MAPI")
     inbox = None
 
+    # Method 1: match by account SMTP address, then find matching root folder
     target = TARGET_EMAIL.lower()
     for account in namespace.Accounts:
         if account.SmtpAddress.lower() == target:
+            # Walk root folders to find one matching the account display name or email
             for folder in namespace.Folders:
                 fname = folder.Name.lower()
                 if account.DisplayName.lower() in fname or target in fname:
@@ -290,6 +314,7 @@ def get_all_emails(outlook):
                         pass
             break
 
+    # Method 2: fallback - scan all root folders for one whose name contains the email or username
     if inbox is None:
         username = target.split("@")[0]
         for folder in namespace.Folders:
@@ -302,17 +327,17 @@ def get_all_emails(outlook):
                     pass
 
     if inbox is None:
+        # Debug: list all root folders so user can identify the right one
         print("ERROR: Could not find inbox for", TARGET_EMAIL)
         print("Available root folders in Outlook:")
         for folder in namespace.Folders:
             print(f"  - {folder.Name}")
-        sys.exit("Set TARGET_EMAIL in the script to match one of the folders above.")
+        sys.exit("Update TARGET_EMAIL or check folder names above.")
 
     print(f"Using inbox: {inbox.Parent.Name} / {inbox.Name}")
     items = []
     _collect_items(inbox, items)
     return items
-
 
 def _collect_items(folder, items):
     for item in folder.Items:
@@ -324,26 +349,28 @@ def _collect_items(folder, items):
     for sub in folder.Folders:
         _collect_items(sub, items)
 
-
 def is_rejection_email(mail):
     try:
-        combined = (mail.Body or "").lower() + " " + (mail.Subject or "").lower()
+        body    = (mail.Body    or "").lower()
+        subject = (mail.Subject or "").lower()
+        combined = body + " " + subject
         return any(phrase in combined for phrase in REJECTION_PHRASES)
     except Exception:
         return False
 
-
 def is_interview_email(mail):
     try:
-        combined = (mail.Body or "").lower() + " " + (mail.Subject or "").lower()
+        body    = (mail.Body    or "").lower()
+        subject = (mail.Subject or "").lower()
+        combined = body + " " + subject
         return any(phrase in combined for phrase in INTERVIEW_PHRASES)
     except Exception:
         return False
 
-
 def matches_company(mail, company):
     company_lower = company.lower().strip()
-    company_core  = re.sub(
+    # Strip legal suffixes for a looser core match
+    company_core = re.sub(
         r"\b(inc|ltd|llc|gmbh|oy|ab|as|nv|plc|group|technologies|consulting|systems)\b",
         "", company_lower).strip()
     if len(company_core) < 3:
@@ -358,10 +385,14 @@ def matches_company(mail, company):
         return False
 
     domain_match = re.search(r"@([\w.-]+)", sender_email)
-    domain       = domain_match.group(1) if domain_match else ""
-    domain_root  = domain.split(".")[0]
-    pattern      = re.compile(r"\b" + re.escape(company_core) + r"\b")
+    domain      = domain_match.group(1) if domain_match else ""
+    domain_root = domain.split(".")[0]
 
+    # Word-boundary pattern for subject/body search
+    pattern = re.compile(r"\b" + re.escape(company_core) + r"\b")
+
+    # Match by sender fields OR company name anywhere in subject/body
+    # This handles both direct company emails and ATS platforms naturally
     return (
         company_core in sender_name
         or company_lower in sender_name
@@ -373,6 +404,105 @@ def matches_company(mail, company):
     )
 
 
+ATS_DOMAINS = {
+    "ashbyhq", "greenhouse", "lever", "workday", "taleo", "jobvite", "icims",
+    "smartrecruiters", "bamboohr", "recruitee", "teamtailor", "workable",
+    "myworkdayjobs", "imocha", "linkedin", "indeed", "glassdoor",
+}
+
+def is_application_email(mail):
+    try:
+        if is_rejection_email(mail) or is_interview_email(mail):
+            return False
+        body     = (mail.Body    or "").lower()
+        subject  = (mail.Subject or "").lower()
+        combined = body + " " + subject
+        return any(phrase in combined for phrase in APPLICATION_PHRASES)
+    except Exception:
+        return False
+
+def extract_company(mail):
+    try:
+        sender_name  = (mail.SenderName         or "").strip()
+        sender_email = (mail.SenderEmailAddress or "").strip()
+        subject      = (mail.Subject            or "")
+        body         = (mail.Body               or "")
+    except Exception:
+        return None
+
+    # 1. Clean sender name — strip generic HR/ATS noise words
+    noise   = re.compile(
+        r'\b(team|recruitment|recruiting|hiring|hr|careers|jobs|noreply|no.reply|'
+        r'talent|people|notifications?|alerts?|updates?|info|donotreply|ops)\b',
+        re.IGNORECASE,
+    )
+    cleaned = noise.sub("", sender_name).strip(" -|,.")
+    # Accept if it's not just a person's name (First Last) and long enough
+    if len(cleaned) >= 3 and not re.fullmatch(r'[A-Z][a-z]+ [A-Z][a-z]+', cleaned):
+        return cleaned
+
+    # 2. Body: "Thank you for considering Reaktor!"
+    for pat in [
+        r"(?:thank you for considering|thank you for your interest in)\s+([A-Z][A-Za-z0-9\s&]+?)(?:\s*[!.,])",
+        r"joining\s+(?:the\s+)?([A-Z][A-Za-z0-9\s&]+?)\s+team",
+    ]:
+        m = re.search(pat, body)
+        if m:
+            company = m.group(1).strip()
+            if 2 <= len(company) <= 50:
+                return company
+
+    # 3. Subject: "Welcome to Kuva Space", "application at Company"
+    for pat in [
+        r"welcome to\s+([A-Za-z0-9][A-Za-z0-9\s&]+?)(?:\s*[!.,]|$)",
+        r"(?:at|from)\s+([A-Z][A-Za-z0-9\s&]+?)(?:\s*[!.,\-]|$)",
+    ]:
+        m = re.search(pat, subject, re.IGNORECASE)
+        if m:
+            company = m.group(1).strip()
+            if 2 <= len(company) <= 50:
+                return company
+
+    # 4. Fallback: domain root if not an ATS platform
+    m = re.search(r"@([\w.-]+)", sender_email)
+    if m:
+        domain_root = m.group(1).lower().split(".")[0]
+        if domain_root not in ATS_DOMAINS and len(domain_root) >= 3:
+            return domain_root.capitalize()
+
+    return None
+
+def extract_role(mail):
+    try:
+        subject = (mail.Subject or "")
+        body    = (mail.Body    or "")
+    except Exception:
+        return None
+
+    for pat in [
+        r"(?:application (?:to|for)|applying (?:to|for))\s+(.+?)\s+(?:at|@)\s",
+        r"(?:for|to)\s+(?:the\s+)?(.+?)\s+(?:position|role|opportunity)\b",
+        r"[-–]\s*([A-Z][^-\n]{3,60}?)\s+(?:at\s+[A-Z]|\()",
+    ]:
+        m = re.search(pat, subject, re.IGNORECASE)
+        if m:
+            role = m.group(1).strip(" -|")
+            if 3 <= len(role) <= 80:
+                return role
+
+    for pat in [
+        r"(?:about our|for the|for our)\s+(.+?)\s+(?:position|role|opportunity)\b",
+        r"your application(?:\s+\w+)?\s+(?:to|for)\s+(?:the\s+)?(.+?)(?:\s+(?:position|role|at)|[,\n])",
+    ]:
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            role = m.group(1).strip(" -|")
+            if 3 <= len(role) <= 80:
+                return role
+
+    return None
+
+
 # ---------- Excel helpers ----------
 
 def load_wb(path):
@@ -380,7 +510,6 @@ def load_wb(path):
     if SHEET_NAME not in wb.sheetnames:
         sys.exit(f"ERROR: Sheet '{SHEET_NAME}' not found in {path}")
     return wb
-
 
 def get_companies(ws):
     companies = {}
@@ -390,16 +519,72 @@ def get_companies(ws):
             companies[cell.row] = str(cell.value).strip()
     return companies
 
+def add_application_row(ws, company, role, date):
+    last_row = DATA_START_ROW - 1
+    for row in ws.iter_rows(min_row=DATA_START_ROW, max_col=COL_COMPANY):
+        if row[COL_COMPANY - 1].value is not None:
+            last_row = row[COL_COMPANY - 1].row
+    new_row = last_row + 1
+    ws.cell(row=new_row, column=COL_COMPANY).value = company
+    ws.cell(row=new_row, column=COL_ROLE).value    = role
+    ws.cell(row=new_row, column=COL_DATE).value    = date
+    ws.cell(row=new_row, column=COL_STATUS).value  = "Applied"
+    ws.cell(row=new_row, column=COL_NOTES).value   = "Await response"
+
+def reorder_and_format(ws):
+    max_col = ws.max_column
+    rows_data = []
+    for row in ws.iter_rows(min_row=DATA_START_ROW, max_col=max_col):
+        if row[COL_COMPANY - 1].value is None:
+            continue
+        rows_data.append([cell.value for cell in row])
+
+    def sort_key(r):
+        return str(r[COL_COMPANY - 1] or "").lower()
+
+    def status(r):
+        return str(r[COL_STATUS - 1] or "").strip().lower()
+
+    interviews = sorted([r for r in rows_data if status(r) == "interview"], key=sort_key)
+    applied    = sorted([r for r in rows_data if status(r) == "applied"],   key=sort_key)
+    declined   = sorted([r for r in rows_data if status(r) == "declined"],  key=sort_key)
+    others     = sorted([r for r in rows_data if status(r) not in ("interview", "applied", "declined")], key=sort_key)
+
+    font_interview = Font(color="00B050")  # green
+    font_applied   = Font(color="BF8F00")  # dark yellow / gold
+    font_declined  = Font(color="FF0000")  # red
+    font_default   = Font()
+    notes_col      = 4  # column E, zero-indexed
+
+    status_fonts = {
+        "interview": font_interview,
+        "applied":   font_applied,
+        "declined":  font_declined,
+    }
+
+    for i, row_vals in enumerate(interviews + applied + others + declined):
+        row_num    = DATA_START_ROW + i
+        row_status = status(row_vals)
+        for j, val in enumerate(row_vals):
+            cell = ws.cell(row=row_num, column=j + 1)
+            if row_status == "declined" and j == notes_col and str(val or "").strip().lower() in ("await response", "awaiting for answer"):
+                cell.value = None
+            else:
+                cell.value = val
+            if j == COL_STATUS - 1:
+                cell.font = status_fonts.get(row_status, font_default)
+
 
 # ---------- Main ----------
 
 def run(excel_path, dry_run, debug):
-    print(f"\n{'[DRY RUN] ' if dry_run else ''}Job Tracker Sync")
-    print(f"Excel : {excel_path}")
+    print(f"\n{'[DRY RUN] ' if dry_run else ''}Job Tracker Auto-Decline")
+    print(f"Excel    : {excel_path}")
+    print(f"Phrases  : {len(REJECTION_PHRASES)} rejection, {len(INTERVIEW_PHRASES)} interview")
     print("-" * 55)
 
-    wb       = load_wb(excel_path)
-    ws       = wb[SHEET_NAME]
+    wb = load_wb(excel_path)
+    ws = wb[SHEET_NAME]
     companies = get_companies(ws)
     print(f"Found {len(companies)} companies in tracker.\n")
 
@@ -417,12 +602,14 @@ def run(excel_path, dry_run, debug):
         print("DEBUG - All emails:")
         for i, mail in enumerate(emails):
             try:
-                combined  = (mail.Body or "").lower() + " " + (mail.Subject or "").lower()
-                rej_match = [p for p in REJECTION_PHRASES if p in combined]
-                int_match = [p for p in INTERVIEW_PHRASES if p in combined]
+                combined = (mail.Body or "").lower() + " " + (mail.Subject or "").lower()
+                rej_match = [p for p in REJECTION_PHRASES  if p in combined]
+                int_match = [p for p in INTERVIEW_PHRASES  if p in combined]
+                app_match = [p for p in APPLICATION_PHRASES if p in combined]
                 flag = ""
                 if rej_match: flag = f" <<< REJECTION: '{rej_match[0]}'"
-                if int_match: flag = f" <<< INTERVIEW: '{int_match[0]}'"
+                elif int_match: flag = f" <<< INTERVIEW: '{int_match[0]}'"
+                elif app_match: flag = f" <<< APPLICATION: '{app_match[0]}'"
                 print(f"  [{i+1:>3}] {(mail.SenderEmailAddress or ''):<40} | {(mail.Subject or '')[:55]}{flag}")
             except Exception:
                 pass
@@ -451,23 +638,58 @@ def run(excel_path, dry_run, debug):
                     except Exception: pass
                 break
 
-    if not rejections and not interviews:
+    # Detect new applications not yet in the tracker
+    tracked_names = {str(c).lower() for c in companies.values()}
+    new_apps = []
+    for mail in emails:
+        if not is_application_email(mail):
+            continue
+        company = extract_company(mail)
+        if not company:
+            continue
+        c_low = company.lower().strip()
+        if any(c_low in t or t in c_low for t in tracked_names):
+            continue
+        if c_low in {a["company"].lower() for a in new_apps}:
+            continue
+        role = extract_role(mail)
+        try:
+            rt   = mail.ReceivedTime
+            date = datetime(rt.year, rt.month, rt.day)
+        except Exception:
+            date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        new_apps.append({"company": company, "role": role, "date": date})
+        tracked_names.add(c_low)
+        if debug:
+            print(f"NEW APP: '{company}' | role: {role} | {date.strftime('%Y-%m-%d')}")
+
+    if not rejections and not interviews and not new_apps:
         print("No updates found. Tracker is up to date.")
         if not debug:
             print("\nTip: run with --debug to see all emails and matched phrases.")
         return
 
     all_updates = {**interviews, **rejections}
-    print(f"\n{'Would update' if dry_run else 'Updating'} {len(all_updates)} row(s):\n")
-    for row_num, company in all_updates.items():
-        status_cell = ws.cell(row=row_num, column=COL_STATUS)
-        old_status  = status_cell.value
-        new_status  = "Declined" if row_num in rejections else "Interview"
-        print(f"  Row {row_num:>3}  {company:<35}  {old_status} -> {new_status}")
-        if not dry_run:
-            status_cell.value = new_status
+    if all_updates:
+        print(f"\n{'Would update' if dry_run else 'Updating'} {len(all_updates)} row(s):\n")
+        for row_num, company in all_updates.items():
+            status_cell = ws.cell(row=row_num, column=COL_STATUS)
+            old_status  = status_cell.value
+            new_status  = "Declined" if row_num in rejections else "Interview"
+            print(f"  Row {row_num:>3}  {company:<35}  {old_status} -> {new_status}")
+            if not dry_run:
+                status_cell.value = new_status
+
+    if new_apps:
+        print(f"\n{'Would add' if dry_run else 'Adding'} {len(new_apps)} new application(s):\n")
+        for app in new_apps:
+            role_str = app["role"] or "role not found in email"
+            print(f"  NEW   {app['company']:<35}  {role_str}")
+            if not dry_run:
+                add_application_row(ws, app["company"], app["role"], app["date"])
 
     if not dry_run:
+        reorder_and_format(ws)
         wb.save(excel_path)
         print(f"\nSaved to {excel_path}  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
     else:
@@ -475,15 +697,14 @@ def run(excel_path, dry_run, debug):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync job tracker Excel with Outlook rejection/interview emails.")
-    parser.add_argument("--excel",   type=Path, default=DEFAULT_EXCEL, help="Path to your job tracker Excel file")
-    parser.add_argument("--dry-run", action="store_true", help="Preview changes without saving")
+    parser = argparse.ArgumentParser(description="Auto-decline job apps based on Outlook rejection emails.")
+    parser.add_argument("--excel",   type=Path, default=DEFAULT_EXCEL, help="Path to job_tracker.xlsx")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without saving")
     parser.add_argument("--debug",   action="store_true", help="Print all emails to diagnose missed matches")
     args = parser.parse_args()
     if not args.excel.exists():
         sys.exit(f"ERROR: Excel file not found: {args.excel}")
     run(args.excel, args.dry_run, args.debug)
-
 
 if __name__ == "__main__":
     main()
